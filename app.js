@@ -27,6 +27,38 @@ let teachers=[
 const SETTINGS_KEY='ntchorere-mon-planning-settings-v1';
 const PROFILE_KEY='ntchorere-mon-planning-profile-v1';
 const ATTENDANCE_KEY='ntchorere-mon-planning-attendance-v1';
+
+const firebaseConfig={
+  apiKey:"AIzaSyDaBqC8g6ayxNNV0P6KZwBmGuKxTt8K-ac",
+  authDomain:"mon-planning-ntchorere.firebaseapp.com",
+  databaseURL:"https://mon-planning-ntchorere-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId:"mon-planning-ntchorere",
+  storageBucket:"mon-planning-ntchorere.firebasestorage.app",
+  messagingSenderId:"815176465560",
+  appId:"1:815176465560:web:f9e4a25b049ad0f67d64ed"
+};
+let firebaseDb=null;
+let firebaseInitPromise=null;
+let firebaseWatchStarted=false;
+function initFirebase(){
+  if(firebaseInitPromise)return firebaseInitPromise;
+  firebaseInitPromise=(async()=>{
+    try{
+      if(!window.firebase)throw new Error('SDK Firebase non chargé');
+      if(!firebase.apps.length)firebase.initializeApp(firebaseConfig);
+      await firebase.auth().signInAnonymously();
+      firebaseDb=firebase.database();
+      return true;
+    }catch(err){
+      console.warn('Firebase indisponible, mode local conservé.',err);
+      return false;
+    }
+  })();
+  return firebaseInitPromise;
+}
+function firebaseAttendancePath(dateKey=librevilleNow().dateKey){
+  return `schools/ntchorere/attendance/${dateKey}`;
+}
 const API_BASE=null;
 let appSettings={directorName:'NYOBE Fils Angeli Franklin',directorRole:'Proviseur',directorPin:'5100',students:0,classes:10,teachersCount:10};
 let currentProfile=null;
@@ -129,9 +161,57 @@ function toMinutes(v){const m=String(v).match(/(\d{1,2})h(\d{2})/);return m?Numb
 function teacherById(id){return teachers.find(t=>t.id===id);}
 function attendanceFor(id){const a=attendanceState[id];return a&&a.dateKey===librevilleNow().dateKey&&a.absent?a:null;}
 function replacementName(a){if(!a)return'';if(a.replacementId)return teacherById(a.replacementId)?.name||a.replacementName||'';return a.replacementName||'';}
-async function syncAttendanceFromServer(){return false;}
-async function pushAttendanceToServer(id,entry){return true;}
-async function clearAttendanceOnServer(id,dateKey=librevilleNow().dateKey){return true;}
+function applyRemoteAttendance(data){
+  const next=data&&typeof data==='object'?data:{};
+  const changed=JSON.stringify(next)!==JSON.stringify(attendanceState);
+  attendanceState=next;
+  localStorage.setItem(ATTENDANCE_KEY,JSON.stringify(attendanceState));
+  if(changed){
+    renderDirection();
+    if(currentProfile?.role==='teacher'){renderTeacherAbsencePanel();renderTeacher();}
+  }
+  return changed;
+}
+function startAttendanceWatch(){
+  if(firebaseWatchStarted||!firebaseDb)return;
+  firebaseWatchStarted=true;
+  firebaseDb.ref(firebaseAttendancePath()).on('value',snap=>applyRemoteAttendance(snap.val()||{}),err=>console.warn('Écoute Firebase interrompue',err));
+}
+async function syncAttendanceFromServer(){
+  const ready=await initFirebase();
+  if(!ready||!firebaseDb)return false;
+  try{
+    const snap=await firebaseDb.ref(firebaseAttendancePath()).once('value');
+    const changed=applyRemoteAttendance(snap.val()||{});
+    startAttendanceWatch();
+    return changed;
+  }catch(err){
+    console.warn('Synchronisation Firebase impossible',err);
+    return false;
+  }
+}
+async function pushAttendanceToServer(id,entry){
+  const ready=await initFirebase();
+  if(!ready||!firebaseDb)return false;
+  try{
+    await firebaseDb.ref(`${firebaseAttendancePath(entry?.dateKey||librevilleNow().dateKey)}/${id}`).set(entry);
+    return true;
+  }catch(err){
+    console.warn('Enregistrement Firebase impossible',err);
+    return false;
+  }
+}
+async function clearAttendanceOnServer(id,dateKey=librevilleNow().dateKey){
+  const ready=await initFirebase();
+  if(!ready||!firebaseDb)return false;
+  try{
+    await firebaseDb.ref(`${firebaseAttendancePath(dateKey)}/${id}`).remove();
+    return true;
+  }catch(err){
+    console.warn('Suppression Firebase impossible',err);
+    return false;
+  }
+}
 function lesson(tid,day,slot){return schedule[tid]?.[day]?.[slot]||null;}
 function statusFor(t){const absence=attendanceFor(t.id);if(absence){const rep=replacementName(absence);return{key:'away',label:'Absent',detail:rep?`Absent aujourd’hui • Remplacé par ${rep}`:'Absent aujourd’hui • Aucun remplacement indiqué'}}const now=librevilleNow();const replacing=Object.entries(attendanceState).find(([id,a])=>id!==t.id&&a?.dateKey===now.dateKey&&a?.absent&&a?.replacementId===t.id);if(replacing){const absentTeacher=teacherById(replacing[0]);return{key:'replace',label:'Remplacement',detail:`Remplace ${absentTeacher?.name||'un collègue'} aujourd’hui`}}const si=DAYS.includes(now.day)?SLOTS.findIndex(s=>now.minutes>=toMinutes(s.start)&&now.minutes<toMinutes(s.end)):-1;if(si<0)return {key:'free',label:'Libre',detail:'Aucun cours prévu à cette heure'};const l=lesson(t.id,now.day,si);return l?{key:'teaching',label:'En cours',detail:`${l[0]} • ${l[1]}`}:{key:'free',label:'Libre',detail:'Aucun cours prévu sur ce créneau'};}
 function nextLesson(tid,day,slot){
